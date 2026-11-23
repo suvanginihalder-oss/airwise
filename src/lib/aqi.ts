@@ -64,8 +64,10 @@ export function calculateSubIndex(
   concentration: number,
   breakpoints: Breakpoint[],
 ): number {
-  if (concentration <= 0) return 0;
-
+  if (!Number.isFinite(concentration)) {
+  throw new RangeError("Concentration must be a finite number");
+}
+if (concentration <= 0) return 0;
   for (const bp of breakpoints) {
     if (concentration <= bp.bHi) {
       const sub =

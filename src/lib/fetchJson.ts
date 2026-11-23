@@ -1,66 +1,42 @@
-import http from 'node:http';
-import https from 'node:https';
+const DEFAULT_TIMEOUT_MS = 10000;
 
 /**
- * Universal HTTP/HTTPS JSON fetcher.
- * Automatically tries HTTPS first, and falls back to HTTP if a TLS/ECONNRESET
- * network handshake issue occurs (e.g. Windows ISP transparent proxies / middleboxes).
+ * Fetches a URL over HTTPS and parses the JSON reply.
+ * Fails clearly on a non-2xx status, invalid JSON, or a timeout.
+ * It never retries over plain HTTP, so data cannot be downgraded to an insecure connection.
  */
-export function fetchJson<T>(url: string): Promise<T> {
-  const tryRequest = (targetUrl: string): Promise<T> => {
-    return new Promise((resolve, reject) => {
-      const isHttps = targetUrl.startsWith('https:');
-      const client = isHttps ? https : http;
+export async function fetchJson<T>(
+  url: string,
+  timeoutMs: number = DEFAULT_TIMEOUT_MS,
+): Promise<T> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
-      const req = client.get(
-        targetUrl,
-        {
-          headers: {
-            'User-Agent': 'AirWise/1.0 (Urban Air Quality Assistant)',
-            Accept: 'application/json'
-          },
-          timeout: 10000
-        },
-        (res) => {
-          const { statusCode } = res;
-          if (!statusCode || statusCode < 200 || statusCode >= 300) {
-            res.resume();
-            return reject(new Error(`Request failed with status code ${statusCode}`));
-          }
-
-          let rawData = '';
-          res.setEncoding('utf8');
-          res.on('data', (chunk) => {
-            rawData += chunk;
-          });
-          res.on('end', () => {
-            try {
-              const parsed = JSON.parse(rawData);
-              resolve(parsed as T);
-            } catch (e) {
-              reject(new Error(`Failed to parse JSON: ${e instanceof Error ? e.message : String(e)}`));
-            }
-          });
-        }
-      );
-
-      req.on('error', (err) => {
-        reject(err);
-      });
-
-      req.on('timeout', () => {
-        req.destroy(new Error(`Request timed out for ${targetUrl}`));
-      });
+  try {
+    const response = await fetch(url, {
+      headers: {
+        "User-Agent": "AirWise/1.0 (Urban Air Quality Assistant)",
+        Accept: "application/json",
+      },
+      signal: controller.signal,
     });
-  };
 
-  return tryRequest(url).catch((err) => {
-    // If https failed due to connection reset, try http
-    if (url.startsWith('https:')) {
-      const httpUrl = url.replace('https:', 'http:');
-      return tryRequest(httpUrl);
+    if (!response.ok) {
+      throw new Error(`Request failed with status code ${response.status}`);
+    }
+
+    try {
+      return (await response.json()) as T;
+    } catch (err: unknown) {
+      const reason = err instanceof Error ? err.message : String(err);
+      throw new Error(`Failed to parse JSON: ${reason}`);
+    }
+  } catch (err: unknown) {
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new Error(`Request timed out after ${timeoutMs} ms`);
     }
     throw err;
-  });
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
-
