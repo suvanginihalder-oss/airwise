@@ -10,8 +10,9 @@ import type {
   HourlyForecastItem,
 } from "../src/types/index.js";
 
-const CACHE_TTL_MS = 30 * 60 * 1000;
+const CACHE_TTL_MS = 15 * 60 * 1000;
 const CACHE_CONTROL = "public, s-maxage=900, stale-while-revalidate=1800";
+const MAX_STATION_AGE_MS = 24 * 60 * 60 * 1000;
 
 interface GeocodingResult {
   results?: Array<{
@@ -25,7 +26,6 @@ interface GeocodingResult {
   }>;
 }
 
-/** Open-Meteo returns null for readings it does not have, so every value may be null. */
 interface OpenMeteoAirQualityResponse {
   latitude: number;
   longitude: number;
@@ -46,9 +46,182 @@ interface OpenMeteoAirQualityResponse {
   };
 }
 
-/** Rounds to one decimal place. Only used for the secondary gases, where a missing value shows as 0. */
+interface OpenAQLocation {
+  id: number;
+  name: string;
+  datetimeLast?: { utc?: string } | null;
+  sensors?: Array<{
+    id: number;
+    parameter?: {
+      id?: number;
+      name?: string;
+      units?: string;
+    };
+  }>;
+}
+
+interface OpenAQLocationsResponse {
+  results?: OpenAQLocation[];
+}
+
+interface OpenAQLatestResponse {
+  results?: Array<{
+    sensorsId: number;
+    value: number;
+    datetime?: { utc?: string };
+  }>;
+}
+
+interface OpenAQStationReading {
+  stationName: string;
+  timestamp: string;
+  pm2_5: number;
+  pm10?: number;
+  nitrogen_dioxide?: number;
+  sulphur_dioxide?: number;
+  ozone?: number;
+  carbon_monoxide?: number;
+}
+
 function round1(value: number | null | undefined): number {
   return value == null ? 0 : Math.round(value * 10) / 10;
+}
+
+function parseUtcMs(utcString: string | undefined): number {
+  if (!utcString) return 0;
+  const parsed = Date.parse(utcString);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function isRecentUtc(utcString: string | undefined, maxAgeMs: number): boolean {
+  const ms = parseUtcMs(utcString);
+  return ms > 0 && Date.now() - ms <= maxAgeMs;
+}
+
+function isMicrogramsPerCubicMeter(units: string | undefined): boolean {
+  if (!units) return true;
+  const normalized = units.toLowerCase().replace(/\s+/g, "");
+  return (
+    normalized.includes("ug/m3") ||
+    normalized.includes("µg/m³") ||
+    normalized.includes("μg/m³")
+  );
+}
+
+async function fetchOpenAQCurrent(
+  latitude: number,
+  longitude: number,
+): Promise<{ reading: OpenAQStationReading | null; status: string }> {
+  const apiKey = process.env.OPENAQ_API_KEY?.trim();
+  if (!apiKey) return { reading: null, status: "openaq-no-key" };
+
+  const headers = { "X-API-Key": apiKey };
+  const locUrl = `https://api.openaq.org/v3/locations?coordinates=${latitude},${longitude}&radius=25000&parameters_id=2&limit=100`;
+
+  const locRes = await fetch(locUrl, {
+    headers,
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!locRes.ok) {
+    console.warn(`OpenAQ locations error: ${locRes.status}`);
+    return { reading: null, status: `openaq-loc-http-${locRes.status}` };
+  }
+
+  const locJson = (await locRes.json()) as OpenAQLocationsResponse;
+  const freshStations = (locJson.results ?? []).filter((loc) =>
+    isRecentUtc(loc.datetimeLast?.utc, MAX_STATION_AGE_MS),
+  );
+  if (freshStations.length === 0) {
+    return { reading: null, status: "openaq-no-fresh-stations" };
+  }
+
+  // Prefer stations with PM10 + newest reading timestamp
+  freshStations.sort((a, b) => {
+    const aHasPm10 = a.sensors?.some(
+      (s) => s.parameter?.name?.toLowerCase() === "pm10" || s.parameter?.id === 1,
+    )
+      ? 1
+      : 0;
+    const bHasPm10 = b.sensors?.some(
+      (s) => s.parameter?.name?.toLowerCase() === "pm10" || s.parameter?.id === 1,
+    )
+      ? 1
+      : 0;
+    if (bHasPm10 !== aHasPm10) return bHasPm10 - aHasPm10;
+    return parseUtcMs(b.datetimeLast?.utc) - parseUtcMs(a.datetimeLast?.utc);
+  });
+
+  for (const station of freshStations.slice(0, 5)) {
+    const sensorMap = new Map(
+      (station.sensors ?? []).map((s) => [s.id, s.parameter]),
+    );
+
+    const latestRes = await fetch(
+      `https://api.openaq.org/v3/locations/${station.id}/latest`,
+      { headers, signal: AbortSignal.timeout(8000) },
+    );
+    if (!latestRes.ok) continue;
+
+    const latestJson = (await latestRes.json()) as OpenAQLatestResponse;
+    let pm25: number | undefined;
+    let pm10: number | undefined;
+    let no2: number | undefined;
+    let so2: number | undefined;
+    let o3: number | undefined;
+    let co: number | undefined;
+    let latestTimestamp: string | undefined;
+
+    for (const item of latestJson.results ?? []) {
+      if (!Number.isFinite(item.value) || item.value < 0) continue;
+      if (
+        item.datetime?.utc &&
+        !isRecentUtc(item.datetime.utc, MAX_STATION_AGE_MS)
+      ) {
+        continue;
+      }
+
+      const param = sensorMap.get(item.sensorsId);
+      const rawName = param?.name?.toLowerCase().replace(/\./g, "");
+      const paramId = param?.id;
+      if (!isMicrogramsPerCubicMeter(param?.units)) continue;
+
+      if (rawName === "pm25" || paramId === 2) {
+        pm25 = round1(item.value);
+        latestTimestamp = item.datetime?.utc || latestTimestamp;
+      } else if (rawName === "pm10" || paramId === 1) {
+        pm10 = round1(item.value);
+      } else if (rawName === "no2") {
+        no2 = round1(item.value);
+      } else if (rawName === "so2") {
+        so2 = round1(item.value);
+      } else if (rawName === "o3") {
+        o3 = round1(item.value);
+      } else if (rawName === "co") {
+        co = round1(item.value);
+      }
+    }
+
+    if (pm25 != null) {
+      return {
+        reading: {
+          stationName: station.name,
+          timestamp:
+            latestTimestamp ||
+            station.datetimeLast?.utc ||
+            new Date().toISOString(),
+          pm2_5: pm25,
+          pm10,
+          nitrogen_dioxide: no2,
+          sulphur_dioxide: so2,
+          ozone: o3,
+          carbon_monoxide: co,
+        },
+        status: `openaq:${station.name}`,
+      };
+    }
+  }
+
+  return { reading: null, status: "openaq-no-valid-latest" };
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -83,6 +256,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const cached = getCached<AirQualityData>(cacheKey);
   if (cached) {
     res.setHeader("Cache-Control", CACHE_CONTROL);
+    res.setHeader("X-AQ-Source", cached.isModelledEstimate ? "open-meteo-cached" : "openaq-cached");
     return res.status(200).json(cached);
   }
 
@@ -92,7 +266,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     let resolvedCityName: string;
     let timezone = "Asia/Kolkata";
 
-    // 1. Pre-indexed coordinates skip the geocoding request for common cities
     const indexed = findIndexedCity(city);
     if (indexed) {
       latitude = indexed.latitude;
@@ -116,32 +289,47 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       timezone = match.timezone || "auto";
     }
 
-    // 2. Current and 48-hour hourly air quality from the Open-Meteo Air Quality API
     const aqUrl = `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${latitude}&longitude=${longitude}&current=pm10,pm2_5,carbon_monoxide,nitrogen_dioxide,sulphur_dioxide,ozone&hourly=pm10,pm2_5&forecast_days=2&timezone=${encodeURIComponent(timezone)}`;
-    const aqData = await fetchJson<OpenMeteoAirQualityResponse>(aqUrl);
 
+    const [openMeteoResult, openAqResult] = await Promise.allSettled([
+      fetchJson<OpenMeteoAirQualityResponse>(aqUrl),
+      fetchOpenAQCurrent(latitude, longitude),
+    ]);
+
+    if (openMeteoResult.status !== "fulfilled") {
+      throw openMeteoResult.reason;
+    }
+
+    const aqData = openMeteoResult.value;
     const cur = aqData.current;
     if (!cur) {
       throw new Error("Current air quality data missing in Open-Meteo response");
     }
-    // Never turn a missing particulate reading into 0: that would show "Good" air by mistake.
     if (cur.pm2_5 == null || cur.pm10 == null) {
       throw new Error("Particulate readings are unavailable for this location");
     }
 
+    const liveStation =
+      openAqResult.status === "fulfilled" ? openAqResult.value.reading : null;
+    const aqSource =
+      openAqResult.status === "fulfilled"
+        ? openAqResult.value.status
+        : "openaq-rejected";
+
     const currentPollutants: CurrentPollutants = {
-      pm2_5: round1(cur.pm2_5),
-      pm10: round1(cur.pm10),
-      nitrogen_dioxide: round1(cur.nitrogen_dioxide),
-      sulphur_dioxide: round1(cur.sulphur_dioxide),
-      ozone: round1(cur.ozone),
-      carbon_monoxide: round1(cur.carbon_monoxide),
+      pm2_5: liveStation?.pm2_5 ?? round1(cur.pm2_5),
+      pm10: liveStation?.pm10 ?? round1(cur.pm10),
+      nitrogen_dioxide:
+        liveStation?.nitrogen_dioxide ?? round1(cur.nitrogen_dioxide),
+      sulphur_dioxide:
+        liveStation?.sulphur_dioxide ?? round1(cur.sulphur_dioxide),
+      ozone: liveStation?.ozone ?? round1(cur.ozone),
+      carbon_monoxide:
+        liveStation?.carbon_monoxide ?? round1(cur.carbon_monoxide),
     };
 
     const aqiResult = computeAQI(currentPollutants);
 
-    // Hours with a missing particulate value are skipped, not set to 0,
-    // so the forecast never shows a false "best hour".
     const hourlyItems: HourlyForecastItem[] = [];
     const times = aqData.hourly?.time ?? [];
     const pm25s = aqData.hourly?.pm2_5 ?? [];
@@ -169,19 +357,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       latitude,
       longitude,
       timezone: aqData.timezone || timezone,
-      timestamp: cur.time || new Date().toISOString(),
+      timestamp: liveStation?.timestamp || cur.time || new Date().toISOString(),
       current: currentPollutants,
       aqi: aqiResult,
       hourly: hourlyItems,
-      sourceAttribution:
-        "Air quality data by Open-Meteo.com, CAMS ENSEMBLE data provider",
-      isModelledEstimate: true,
+      sourceAttribution: liveStation
+        ? `Live station data by OpenAQ (${liveStation.stationName}); 48h forecast by Open-Meteo.com, CAMS ENSEMBLE`
+        : "Air quality data by Open-Meteo.com, CAMS ENSEMBLE data provider",
+      isModelledEstimate: !liveStation,
       gridResolutionKm: 11,
     };
 
     setCached(cacheKey, payload, CACHE_TTL_MS);
 
     res.setHeader("Cache-Control", CACHE_CONTROL);
+    res.setHeader("X-AQ-Source", aqSource);
     return res.status(200).json(payload);
   } catch (error: unknown) {
     const message =

@@ -11,6 +11,32 @@ interface ChatDrawerProps {
   members: string[];
 }
 
+interface ChatApiResponse {
+  reply: string;
+  isFallback?: boolean;
+}
+
+function isChatApiResponse(value: unknown): value is ChatApiResponse {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  const hasValidReply =
+    typeof candidate.reply === "string" && candidate.reply.trim().length > 0;
+  const hasValidFallback =
+    candidate.isFallback === undefined ||
+    typeof candidate.isFallback === "boolean";
+
+  return hasValidReply && hasValidFallback;
+}
+
+function formatMessageContent(content: string, isFallback?: boolean): string {
+  if (isFallback === true) {
+    return content.replace(/^\[Offline mode[^\]]*\]\s*/i, "");
+  }
+  return content;
+}
+
 export const ChatDrawer: React.FC<ChatDrawerProps> = ({
   isOpen,
   onClose,
@@ -30,24 +56,25 @@ export const ChatDrawer: React.FC<ChatDrawerProps> = ({
       }),
     },
   ]);
-  const [input, setInput] = React.useState("");
-  const [loading, setLoading] = React.useState(false);
+  const [input, setInput] = React.useState<string>("");
+  const [loading, setLoading] = React.useState<boolean>(false);
+  const messagesEndRef = React.useRef<HTMLDivElement | null>(null);
 
-  const suggestedQuestions = [
+  const suggestedQuestions: readonly string[] = [
     "Should my children attend morning sports in this air?",
     "How do I build a cheap DIY HEPA fan filter at home?",
     "Do indoor houseplants actually filter PM2.5 smog?",
     "When is the safest 2-hour window today to open windows?",
   ];
 
-  const handleSend = async (questionText?: string) => {
-    const textToSend = questionText || input;
-    if (!textToSend.trim() || loading) return;
+  const handleSend = async (questionText?: string): Promise<void> => {
+    const trimmed = (questionText ?? input).trim();
+    if (!trimmed || loading) return;
 
     const userMsg: ChatMessage = {
       id: `u-${Date.now()}`,
       sender: "user",
-      content: textToSend.trim(),
+      content: trimmed,
       timestamp: new Date().toLocaleTimeString([], {
         hour: "2-digit",
         minute: "2-digit",
@@ -63,10 +90,10 @@ export const ChatDrawer: React.FC<ChatDrawerProps> = ({
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          message: textToSend.trim(),
-          city,
+          message: trimmed,
           aqi,
           band,
+          city,
           members,
         }),
       });
@@ -75,16 +102,21 @@ export const ChatDrawer: React.FC<ChatDrawerProps> = ({
         throw new Error(`Chat API error: status ${res.status}`);
       }
 
-      const data = await res.json();
+      const raw: unknown = await res.json();
+      if (!isChatApiResponse(raw)) {
+        throw new Error("Invalid response payload from /api/chat");
+      }
+
+      const isOfflineFallback = raw.isFallback === true;
       const botMsg: ChatMessage = {
         id: `b-${Date.now()}`,
         sender: "assistant",
-        content: data.reply,
+        content: raw.reply,
         timestamp: new Date().toLocaleTimeString([], {
           hour: "2-digit",
           minute: "2-digit",
         }),
-        isFallback: data.isFallback,
+        isFallback: isOfflineFallback,
       };
       setMessages((prev) => [...prev, botMsg]);
     } catch {
@@ -107,7 +139,13 @@ export const ChatDrawer: React.FC<ChatDrawerProps> = ({
   };
 
   React.useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
+    if (isOpen) {
+      messagesEndRef.current?.scrollIntoView?.({ behavior: "smooth" });
+    }
+  }, [messages, loading, isOpen]);
+
+  React.useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent): void => {
       if (e.key === "Escape" && isOpen) {
         onClose();
       }
@@ -175,7 +213,12 @@ export const ChatDrawer: React.FC<ChatDrawerProps> = ({
                     : "bg-white text-slate-800 border border-slate-200 rounded-tl-none"
                 }`}
               >
-                <div>{m.content}</div>
+                {m.sender === "assistant" && m.isFallback === true && (
+                  <div className="inline-flex items-center text-[10px] font-semibold uppercase tracking-wide text-amber-800 bg-amber-100 border border-amber-300 rounded-full px-2 py-0.5 mb-1.5">
+                    Offline mode
+                  </div>
+                )}
+                <div>{formatMessageContent(m.content, m.isFallback)}</div>
                 <div
                   className={`text-[9px] mt-1 font-mono ${
                     m.sender === "user" ? "text-emerald-200" : "text-slate-400"
@@ -193,6 +236,7 @@ export const ChatDrawer: React.FC<ChatDrawerProps> = ({
               <span>AirWise is thinking...</span>
             </div>
           )}
+          <div ref={messagesEndRef} />
         </div>
 
         {/* Suggested Prompts */}
@@ -205,8 +249,11 @@ export const ChatDrawer: React.FC<ChatDrawerProps> = ({
               <button
                 key={idx}
                 type="button"
-                onClick={() => handleSend(q)}
-                className="text-[11px] bg-slate-100 hover:bg-emerald-50 hover:text-emerald-800 text-slate-700 px-2.5 py-1 rounded-full border border-slate-200 transition-colors text-left focus:ring-1 focus:ring-emerald-500 focus:outline-none"
+                disabled={loading}
+                onClick={() => {
+                  void handleSend(q);
+                }}
+                className="text-[11px] bg-slate-100 hover:bg-emerald-50 hover:text-emerald-800 disabled:opacity-50 text-slate-700 px-2.5 py-1 rounded-full border border-slate-200 transition-colors text-left focus:ring-1 focus:ring-emerald-500 focus:outline-none"
               >
                 {q}
               </button>
@@ -218,7 +265,7 @@ export const ChatDrawer: React.FC<ChatDrawerProps> = ({
         <form
           onSubmit={(e) => {
             e.preventDefault();
-            handleSend();
+            void handleSend();
           }}
           className="p-3 bg-white border-t border-slate-200 flex items-center gap-2"
         >

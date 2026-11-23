@@ -16,8 +16,9 @@ interface GeminiResponse {
 const REQUEST_TIMEOUT_MS = 20000;
 
 /** Used when GEMINI_MODEL / GEMINI_FALLBACK_MODELS are not set. Model names change, so prefer the env vars. */
-const DEFAULT_MODEL = "gemini-3.5-flash";
-const DEFAULT_FALLBACK_MODELS = "gemini-3.5-flash-lite,gemini-flash-lite-latest";
+const DEFAULT_MODEL = "gemini-3.6-flash";
+const DEFAULT_FALLBACK_MODELS =
+  "gemini-3.5-flash-lite,gemini-3.1-flash-lite";
 
 /** HTTP statuses where trying a different model can help (quota, retired model, overload). */
 const RETRYABLE_STATUSES = new Set([404, 429, 500, 503]);
@@ -25,10 +26,21 @@ const RETRYABLE_STATUSES = new Set([404, 429, 500, 503]);
 /** An error that another model cannot fix, such as a bad key or a malformed request. */
 class FatalGeminiError extends Error {}
 
+function stripJsonFences(text: string): string {
+  const trimmed = text.trim();
+  if (trimmed.startsWith("```")) {
+    return trimmed
+      .replace(/^```(?:json)?\s*/i, "")
+      .replace(/\s*```$/, "")
+      .trim();
+  }
+  return trimmed;
+}
+
 /**
  * Calls the Gemini REST API and validates the JSON reply with Zod.
  * Tries the primary model first, then each fallback model when a model is out of quota,
- * retired or overloaded. The key is sent in the x-goog-api-key header, never in the URL.
+ * retired or overloaded.
  *
  * @param outputExample optional example JSON that shows the model the exact shape to return
  */
@@ -76,8 +88,8 @@ export async function callGeminiJson<T>(
     const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
     try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
-      const response = await fetch(url, {
+      const baseUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+      let response = await fetch(baseUrl, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -86,6 +98,18 @@ export async function callGeminiJson<T>(
         body: JSON.stringify(requestBody),
         signal: controller.signal,
       });
+
+      // Google's newer AQ.-prefixed keys can return 401 with x-goog-api-key; retry with ?key=
+      if (response.status === 401 && apiKey.startsWith("AQ.")) {
+        response = await fetch(`${baseUrl}?key=${encodeURIComponent(apiKey)}`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(requestBody),
+          signal: controller.signal,
+        });
+      }
 
       if (!response.ok) {
         const errorText = await response.text();
@@ -98,7 +122,9 @@ export async function callGeminiJson<T>(
           lastError = new Error(`Model ${model} returned status ${status}`);
           continue;
         }
-        throw new FatalGeminiError(`Gemini API error (status ${status})`);
+        throw new FatalGeminiError(
+          `Gemini API error (status ${status}): ${errorText.slice(0, 200)}`,
+        );
       }
 
       const resJson: GeminiResponse = await response.json();
@@ -107,7 +133,7 @@ export async function callGeminiJson<T>(
         throw new Error("Empty response received from Gemini");
       }
 
-      const validated = schema.parse(JSON.parse(rawText));
+      const validated = schema.parse(JSON.parse(stripJsonFences(rawText)));
       return { data: validated, modelUsed: model, fallbackUsed: i > 0 };
     } catch (err: unknown) {
       if (err instanceof FatalGeminiError) throw err;

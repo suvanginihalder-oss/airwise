@@ -1,31 +1,5 @@
 import type { AQIBand, AQIResult } from "../types/index.js";
 
-/**
- * CPCB (Central Pollution Control Board, Ministry of Environment, Forest & Climate Change, India)
- * Official National Air Quality Index (NAQI) Breakpoints:
- * Reference: CPCB NAQI Technical Report (2014) / CPCB Breakpoint Criteria
- *
- * PM2.5 (24-hr average in µg/m³):
- *   Good:         0 - 30      (AQI: 0 - 50)
- *   Satisfactory: 31 - 60     (AQI: 51 - 100)
- *   Moderate:     61 - 90     (AQI: 101 - 200)
- *   Poor:         91 - 120    (AQI: 201 - 300)
- *   Very Poor:    121 - 250   (AQI: 301 - 400)
- *   Severe:       250+        (AQI: 401 - 500)
- *
- * PM10 (24-hr average in µg/m³):
- *   Good:         0 - 50      (AQI: 0 - 50)
- *   Satisfactory: 51 - 100    (AQI: 51 - 100)
- *   Moderate:     101 - 250   (AQI: 101 - 200)
- *   Poor:         251 - 350   (AQI: 201 - 300)
- *   Very Poor:    351 - 430   (AQI: 301 - 400)
- *   Severe:       430+        (AQI: 401 - 500)
- *
- * WHO 2021 Global Air Quality Guidelines:
- *   PM2.5 24-hr mean limit: 15 µg/m³
- *   PM10 24-hr mean limit:  45 µg/m³
- */
-
 export const WHO_GUIDELINES = {
   PM25_24H_LIMIT: 15,
   PM10_24H_LIMIT: 45,
@@ -56,34 +30,26 @@ const PM10_BREAKPOINTS: Breakpoint[] = [
   { bLo: 431, bHi: 600, iLo: 401, iHi: 500 },
 ];
 
-/**
- * Linear interpolation to calculate sub-index Ip for a given concentration Cp
- * Ip = [ (IHi - ILo) / (BHi - BLo) ] * (Cp - BLo) + ILo
- */
 export function calculateSubIndex(
   concentration: number,
   breakpoints: Breakpoint[],
 ): number {
   if (!Number.isFinite(concentration)) {
-  throw new RangeError("Concentration must be a finite number");
-}
-if (concentration <= 0) return 0;
+    throw new RangeError("Concentration must be a finite number");
+  }
+  if (concentration <= 0) return 0;
   for (const bp of breakpoints) {
     if (concentration <= bp.bHi) {
+      const clamped = Math.max(bp.bLo, concentration);
       const sub =
-        ((bp.iHi - bp.iLo) / (bp.bHi - bp.bLo)) * (concentration - bp.bLo) +
-        bp.iLo;
+        ((bp.iHi - bp.iLo) / (bp.bHi - bp.bLo)) * (clamped - bp.bLo) + bp.iLo;
       return Math.round(Math.min(500, Math.max(0, sub)));
     }
   }
 
-  // Above the highest breakpoint: scale beyond 500 or cap at 500 (standard CPCB scales up to 500)
   return 500;
 }
 
-/**
- * Determine the CPCB AQI Band from overall AQI value
- */
 export function getAQIBand(aqi: number): AQIBand {
   if (aqi <= 50) return "Good";
   if (aqi <= 100) return "Satisfactory";
@@ -93,9 +59,6 @@ export function getAQIBand(aqi: number): AQIBand {
   return "Severe";
 }
 
-/**
- * Returns color tokens and badges for each band
- */
 export function getBandDetails(band: AQIBand): {
   color: string;
   bgColor: string;
@@ -167,11 +130,6 @@ export function getBandDetails(band: AQIBand): {
   }
 }
 
-/**
- * Computes official CPCB AQI from pollutant values
- * Requires at least 3 parameters including PM2.5 or PM10 (CPCB rule: minimum 3 pollutants with 1 particulate).
- * We calculate sub-indices for PM2.5 and PM10, pick the maximum as overall AQI.
- */
 export function computeAQI(params: {
   pm2_5: number;
   pm10: number;
@@ -186,7 +144,6 @@ export function computeAQI(params: {
   let overallAqi = Math.max(pm25Sub, pm10Sub);
   const prominent: "PM2.5" | "PM10" = pm25Sub >= pm10Sub ? "PM2.5" : "PM10";
 
-  // Minimum clamp at 1 if non-zero
   if (overallAqi === 0 && (params.pm2_5 > 0 || params.pm10 > 0)) {
     overallAqi = 1;
   }
